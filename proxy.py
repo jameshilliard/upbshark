@@ -1,5 +1,9 @@
 import asyncio
 import sys
+from binascii import unhexlify
+
+from const import PimCommand, UpbMessage, UpbTransmission, UPB_MESSAGE_PIMREPORT_TYPE, INITIAL_PIM_REG_QUERY_BASE
+from util import cksum
 
 class PIM(asyncio.Protocol):
 
@@ -13,13 +17,29 @@ class PIM(asyncio.Protocol):
         self.transport = transport
 
     def line_received(self, line):
-        print(f"PIM line: {line}")
+        command = UpbMessage(line[0])
+        data = line[1:]
+        if command != UpbMessage.UPB_MESSAGE_IDLE:
+            print(f"PIM {command.name} data: {data}")
+        if command == UpbMessage.UPB_MESSAGE_PIMREPORT:
+            print(f"got pim report: {hex(data[0])} with len: {len(data)}")
+            if len(data) > UPB_MESSAGE_PIMREPORT_TYPE:
+                transmission = UpbTransmission(data[0])
+                print(f"transmission: {transmission.name}")
+                if transmission == UpbTransmission.UPB_PIM_REGISTERS:
+                    register_data = unhexlify(data[1:])
+                    start = register_data[0]
+                    register_val = register_data[1:]
+                    print(f"start: {hex(start)} register_val: {register_val}")
+                    if start == INITIAL_PIM_REG_QUERY_BASE:
+                        print("got pim in initial phase query mode")
 
     def data_received(self, data):
         self.buffer += data
         while b'\r' in self.buffer:
             line, self.buffer = self.buffer.split(b'\r', 1)
-            self.line_received(line)
+            if len(line) > 1:
+                self.line_received(line)
         if self.server_transport:
             self.server_transport.write(data)
 
@@ -42,13 +62,21 @@ class Upstart(asyncio.Protocol):
         self.client.transport.write(data)
 
     def line_received(self, line):
-        print(f"Upstart line: {line}")
+        command = PimCommand(line[0])
+        data = unhexlify(line[1:-2])
+        crc = int(line[-2:], 16)
+        computed_crc = cksum(data)
+        if crc == computed_crc:
+            print(f'Upstart {command.name} data: {data}')
+        else:
+            print(f'Upstart corrupt data line: {line}')
 
     def data_received(self, data):
         self.buffer += data
         while b'\r' in self.buffer:
             line, self.buffer = self.buffer.split(b'\r', 1)
-            self.line_received(line)
+            if len(line) > 1:
+                self.line_received(line)
         self.send_data(data)
 
     def connection_lost(self, *args):
