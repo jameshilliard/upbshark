@@ -2,7 +2,7 @@ import asyncio
 import sys
 from binascii import unhexlify
 
-from const import PimCommand, UpbMessage, UpbTransmission, UPB_MESSAGE_PIMREPORT_TYPE, INITIAL_PIM_REG_QUERY_BASE
+from const import PimCommand, UpbMessage, UpbTransmission, UPB_MESSAGE_TYPE, UPB_MESSAGE_PIMREPORT_TYPE, INITIAL_PIM_REG_QUERY_BASE
 from util import cksum
 
 class PIM(asyncio.Protocol):
@@ -17,17 +17,17 @@ class PIM(asyncio.Protocol):
         self.transport = transport
 
     def line_received(self, line):
-        command = UpbMessage(line[0])
-        data = line[1:]
+        command = UpbMessage(line[UPB_MESSAGE_TYPE])
         if command != UpbMessage.UPB_MESSAGE_IDLE:
+            data = line[1:]
             print(f"PIM {command.name} data: {data}")
         if command == UpbMessage.UPB_MESSAGE_PIMREPORT:
-            print(f"got pim report: {hex(data[0])} with len: {len(data)}")
-            if len(data) > UPB_MESSAGE_PIMREPORT_TYPE:
-                transmission = UpbTransmission(data[0])
+            print(f"got pim report: {hex(line[UPB_MESSAGE_PIMREPORT_TYPE])} with len: {len(line)}")
+            if len(line) > UPB_MESSAGE_PIMREPORT_TYPE:
+                transmission = UpbTransmission(line[UPB_MESSAGE_PIMREPORT_TYPE])
                 print(f"transmission: {transmission.name}")
                 if transmission == UpbTransmission.UPB_PIM_REGISTERS:
-                    register_data = unhexlify(data[1:])
+                    register_data = unhexlify(line[UPB_MESSAGE_PIMREPORT_TYPE + 1:])
                     start = register_data[0]
                     register_val = register_data[1:]
                     print(f"start: {hex(start)} register_val: {register_val}")
