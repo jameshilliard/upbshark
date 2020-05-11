@@ -9,6 +9,8 @@ MINIMUM_BLINK_RATE = 20
 UPB_MESSAGE_TYPE = 0
 UPB_MESSAGE_PIMREPORT_TYPE = 1
 
+PACKETHEADER_LINKBIT = 0x80
+
 class UpbTransmission(Enum):
     UPB_MESSAGE = 0x55 # U
     UPB_PIM_ACCEPT = 0x41 # A
@@ -31,6 +33,10 @@ class UpbMessage(Enum):
     UPB_MESSAGE_DROP = 0x44 # D
     UPB_MESSAGE_IDLE = 0x2d # -
     UPB_MESSAGE_TRANSMITTED = 0x54 # T
+
+    @classmethod
+    def has_value(cls, value):
+        return value in cls._value2member_map_
 
 class PimCommand(Enum):
     UPB_NETWORK_TRANSMIT = 0x14
@@ -56,6 +62,30 @@ class UpbReg(Enum):
     UPB_REG_SIGNALSTRENGTH = 0xf9
     UPB_REG_NOISEFLOOR = 0xfa
     UPB_REG_NOISECOUNTS = 0xfb
+
+class UpbDeviceId(Enum):
+    BROADCAST_DEVICEID = 0x00
+    RESERVED1_DEVICEID = 0xfb
+    RESERVED2_DEVICEID = 0xfc
+    WRITEENABLED_DEVICEID = 0xfd
+    SETUPMODE_DEVICEID = 0xfe
+    DEFAULT_DEVICEID = 0xff
+
+    @classmethod
+    def has_value(cls, value):
+        return value in cls._value2member_map_
+
+class UpbReqAck(Enum):
+    REQ_ACKDEFAULT = 0x00
+    REQ_ACKMESSAGE = 0x01
+    REQ_NOACK = 0x02
+    REQ_ACKNOREQUEUEONNAK = 0x04
+
+class UpbReqRepeater(Enum):
+    REP_NONREPEATER = 0x00
+    REP_LOWREPEAT = 0x01
+    REP_MEDIUMREPEAT = 0x02
+    REP_HIGHREPEAT = 0x03
 
 INITIAL_PIM_REG_QUERY_BASE = UpbReg.UPB_REG_UPBOPTIONS.value
 
