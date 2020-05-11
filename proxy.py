@@ -13,30 +13,23 @@ class PIM(asyncio.Protocol):
     def __init__(self):
         self.server_transport = None
         self.buffer = b''
-        self.last_command = b''
+        self.last_command = {}
+        self.message_buffer = b''
 
     def connection_made(self, transport):
         print("connected to PIM")
         self.connected = True
         self.transport = transport
 
-    def get_response_type(self):
-        cmd = self.last_command[1]
-        print(f"cmd: {hex(cmd)}")
-        return (((cmd) >> 8) & 0xe0)
-
     def line_received(self, line):
         if UpbMessage.has_value(line[UPB_MESSAGE_TYPE]):
             command = UpbMessage(line[UPB_MESSAGE_TYPE])
-            if command != UpbMessage.UPB_MESSAGE_IDLE:
-                data = line[1:]
+            data = line[1:]
+            if command != UpbMessage.UPB_MESSAGE_IDLE and not UpbMessage.is_message_data(command):
                 print(f"PIM {command.name} data: {data}")
             if command == UpbMessage.UPB_MESSAGE_PIMREPORT:
                 print(f"got pim report: {hex(line[UPB_MESSAGE_PIMREPORT_TYPE])} with len: {len(line)}")
                 if len(line) > UPB_MESSAGE_PIMREPORT_TYPE:
-                    response_type = self.get_response_type()
-                    print(f"response_type: {hex(response_type)}")
-                    #message_type = 
                     transmission = UpbTransmission(line[UPB_MESSAGE_PIMREPORT_TYPE])
                     print(f"transmission: {transmission.name}")
                     if transmission == UpbTransmission.UPB_PIM_REGISTERS:
@@ -50,10 +43,19 @@ class PIM(asyncio.Protocol):
                         print("got pim accept")
                 else:
                     print(f'got corrupt pim report: {hex(line[UPB_MESSAGE_PIMREPORT_TYPE])} with len: {len(line)}')
+
+            elif command == UpbMessage.UPB_MESSAGE_SYNC:
+                print("Got upb sync")
+            elif command == UpbMessage.UPB_MESSAGE_START:
+                print("Got upb start, clearing message buffer")
+                self.message_buffer = b''
+            elif UpbMessage.is_message_data(command):
+                self.message_buffer += unhexlify(data)
+            elif command == UpbMessage.UPB_MESSAGE_NAK:
+                print(f"Got upb message data: {self.message_buffer}")
+                self.message_buffer = b''
         else:
             print(f'PIM failed to parse line: {line}')
-
-        #elif command == UpbMessage.UPB_MESSAGE_PIMREPORT:
 
     def data_received(self, data):
         self.buffer += data
@@ -85,7 +87,6 @@ class Upstart(asyncio.Protocol):
     def line_received(self, line):
         command = PimCommand(line[0])
         data = unhexlify(line[1:-2])
-        self.client.last_command = data
         crc = int(line[-2:], 16)
         computed_crc = cksum(data)
         if crc == computed_crc:
@@ -128,6 +129,7 @@ class Upstart(asyncio.Protocol):
                 if mdid_cmd == MdidCoreCmd.MDID_CORE_COMMAND_GETREGISTERVALUES:
                     last_command['register_start'] = data[6]
                     last_command['registers'] = data[7]
+                self.client.last_command = last_command
                 pprint(last_command)
                 if UpbDeviceId.has_value(destination_id):
                     if UpbDeviceId(destination_id) == UpbDeviceId.BROADCAST_DEVICEID:

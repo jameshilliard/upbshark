@@ -38,6 +38,16 @@ class UpbMessage(Enum):
     def has_value(cls, value):
         return value in cls._value2member_map_
 
+    @classmethod
+    def is_message_data(cls, value):
+        if value == cls.UPB_MESSAGE_DATA_0 or \
+        value == cls.UPB_MESSAGE_DATA_1 or \
+        value == cls.UPB_MESSAGE_DATA_2 or \
+        value == cls.UPB_MESSAGE_DATA_3:
+            return True
+        return False
+
+
 class PimCommand(Enum):
     UPB_NETWORK_TRANSMIT = 0x14
     UPB_PIM_READ = 0x12
