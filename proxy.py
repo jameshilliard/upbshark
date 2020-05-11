@@ -4,6 +4,7 @@ from pprint import pprint
 from binascii import unhexlify
 
 from const import PimCommand, UpbMessage, UpbDeviceId, UpbTransmission, UpbReqAck, UpbReqRepeater, \
+MdidSet, MdidCoreCmd, MdidDeviceControlCmd, MdidCoreReport, \
 UPB_MESSAGE_TYPE, UPB_MESSAGE_PIMREPORT_TYPE, INITIAL_PIM_REG_QUERY_BASE, PACKETHEADER_LINKBIT
 from util import cksum
 
@@ -102,6 +103,14 @@ class Upstart(asyncio.Protocol):
                 transmit_seq = control_word[1] & 0x03
                 network_id = data[2]
                 destination_id = data[3]
+                device_id = UpbDeviceId(data[4])
+                mdid_set = MdidSet(data[5] & 0xe0)
+                if mdid_set == MdidSet.MDID_CORE_COMMANDS:
+                    mdid_cmd = MdidCoreCmd(data[5] & 0x1f)
+                elif mdid_set == MdidSet.MDID_DEVICE_CONTROL_COMMANDS:
+                    mdid_cmd = MdidDeviceControlCmd(data[5] & 0x1f)
+                elif mdid_set == MdidSet.MDID_CORE_REPORTS:
+                    mdid_cmd = MdidCoreReport(data[5] & 0x1f)
                 last_command = {
                     'link_bit': link_bit,
                     'repeater_request': repeater_request,
@@ -110,9 +119,15 @@ class Upstart(asyncio.Protocol):
                     'transmit_seq': transmit_seq,
                     'network_id': network_id,
                     'destination_id': destination_id,
+                    'device_id': device_id,
+                    'mdid_set': mdid_set,
+                    'mdid_cmd': mdid_cmd,
                     'data_len': data_len,
-                    'data': data[4:]
+                    'data': data[6:]
                 }
+                if mdid_cmd == MdidCoreCmd.MDID_CORE_COMMAND_GETREGISTERVALUES:
+                    last_command['register_start'] = data[6]
+                    last_command['registers'] = data[7]
                 pprint(last_command)
                 if UpbDeviceId.has_value(destination_id):
                     if UpbDeviceId(destination_id) == UpbDeviceId.BROADCAST_DEVICEID:
