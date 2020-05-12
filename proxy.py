@@ -5,7 +5,7 @@ from binascii import unhexlify
 
 from const import PimCommand, UpbMessage, UpbDeviceId, UpbTransmission, UpbReqAck, UpbReqRepeater, \
 MdidSet, MdidCoreCmd, MdidDeviceControlCmd, MdidCoreReport, \
-UPB_MESSAGE_TYPE, UPB_MESSAGE_PIMREPORT_TYPE, INITIAL_PIM_REG_QUERY_BASE, PACKETHEADER_LINKBIT
+UPB_MESSAGE_TYPE, UPB_MESSAGE_PIMREPORT_TYPE, INITIAL_PIM_REG_QUERY_BASE, PACKETHEADER_LINKBIT, PULSE_REPORT_BYTES
 from util import cksum
 
 class PIM(asyncio.Protocol):
@@ -15,17 +15,31 @@ class PIM(asyncio.Protocol):
         self.buffer = b''
         self.last_command = {}
         self.message_buffer = b''
+        self.transmitted_buffer = b''
+        self.pim_accept = False
+        self.pulse_data = 0x00
+        self.pulse_data_buffer = bytearray()
+        self.pulse_data_seq = 0
+        self.pulse_data_bit_pos = 8
 
     def connection_made(self, transport):
         print("connected to PIM")
         self.connected = True
         self.transport = transport
 
+    def reset_pulse_data(self):
+        print('resetting pulse data')
+        self.message_buffer += self.pulse_data_buffer
+        self.pulse_data = 0x00
+        self.pulse_data_buffer = bytearray()
+        self.pulse_data_seq = 0
+        self.pulse_data_bit_pos = 8
+
     def line_received(self, line):
         if UpbMessage.has_value(line[UPB_MESSAGE_TYPE]):
             command = UpbMessage(line[UPB_MESSAGE_TYPE])
             data = line[1:]
-            if command != UpbMessage.UPB_MESSAGE_IDLE and not UpbMessage.is_message_data(command):
+            if command != UpbMessage.UPB_MESSAGE_IDLE:
                 print(f"PIM {command.name} data: {data}")
             if command == UpbMessage.UPB_MESSAGE_PIMREPORT:
                 print(f"got pim report: {hex(line[UPB_MESSAGE_PIMREPORT_TYPE])} with len: {len(line)}")
@@ -40,20 +54,59 @@ class PIM(asyncio.Protocol):
                         if start == INITIAL_PIM_REG_QUERY_BASE:
                             print("got pim in initial phase query mode")
                     elif transmission == UpbTransmission.UPB_PIM_ACCEPT:
+                        self.pim_accept = True
                         print("got pim accept")
                 else:
                     print(f'got corrupt pim report: {hex(line[UPB_MESSAGE_PIMREPORT_TYPE])} with len: {len(line)}')
 
             elif command == UpbMessage.UPB_MESSAGE_SYNC:
                 print("Got upb sync")
+                self.pim_accept = False
             elif command == UpbMessage.UPB_MESSAGE_START:
-                print("Got upb start, clearing message buffer")
                 self.message_buffer = b''
+                self.transmitted_buffer = b''
             elif UpbMessage.is_message_data(command):
-                self.message_buffer += unhexlify(data)
-            elif command == UpbMessage.UPB_MESSAGE_NAK:
-                print(f"Got upb message data: {self.message_buffer}")
+                if len(data) == 2:
+                    seq = unhexlify(b'0' + data[1:2])[0]
+                    if seq != self.pulse_data_seq:
+                        self.reset_pulse_data()
+                    if seq == self.pulse_data_seq:
+                        print(f'self.pulse_data_bit_pos: {self.pulse_data_bit_pos}')
+                        self.pulse_data_bit_pos -= 2
+                        self.pulse_data |= (command.value - 0x30) << self.pulse_data_bit_pos
+                        self.pulse_data_seq += 1
+                        if self.pulse_data_seq > 0x0f:
+                            self.pulse_data_seq = 0
+                        print(f'self.pulse_data: {hex(self.pulse_data)}')
+                        if self.pulse_data_bit_pos == 0x00:
+                            self.pulse_data_buffer.append(self.pulse_data)
+                            self.pulse_data = 0x00
+                            self.pulse_data_bit_pos = 8
+                    else:
+                        print(f"Got upb message data bad seq: {self.message_buffer}")
+
+            elif command == UpbMessage.UPB_MESSAGE_TRANSMITTED:
+                if self.pim_accept:
+                    self.transmitted_buffer += unhexlify(data)
+                else:
+                    print("git pim transmission outside of accept")
+            elif command == UpbMessage.UPB_MESSAGE_ACK or command == UpbMessage.UPB_MESSAGE_NAK:
+                self.reset_pulse_data()
+                if len(self.transmitted_buffer) != 0:
+                    print(f"Got upb pim message data: {self.transmitted_buffer}")
+                elif len(self.message_buffer) != 0:
+                    print(f"Got upb message data: {self.message_buffer}")
+                if len(self.message_buffer) != 0:
+                    if self.last_command.get('mdid_cmd', None) == MdidCoreCmd.MDID_CORE_COMMAND_GETREGISTERVALUES:
+                        print(f"Decoding registers with length {len(self.message_buffer)}")
+                        for index in range(len(self.message_buffer)):
+                            print(f"Reg index: {hex(index)}, value: {hex(self.message_buffer[index])}")
+                    elif self.last_command.get('mdid_cmd', None) == MdidCoreCmd.MDID_CORE_COMMAND_GETDEVICESIGNATURE:
+                        print(f"Decoding signature with length {len(self.message_buffer)}")
+                        for index in range(len(self.message_buffer)):
+                            print(f"Reg index: {hex(index)}, value: {hex(self.message_buffer[index])}")
                 self.message_buffer = b''
+                self.transmitted_buffer = b''
         else:
             print(f'PIM failed to parse line: {line}')
 
@@ -123,12 +176,14 @@ class Upstart(asyncio.Protocol):
                     'device_id': device_id,
                     'mdid_set': mdid_set,
                     'mdid_cmd': mdid_cmd,
-                    'data_len': data_len,
-                    'data': data[6:]
+                    'data_len': data_len
                 }
                 if mdid_cmd == MdidCoreCmd.MDID_CORE_COMMAND_GETREGISTERVALUES:
                     last_command['register_start'] = data[6]
                     last_command['registers'] = data[7]
+                    last_command['data'] = data[8:]
+                else:
+                    last_command['data'] = data[6:]
                 self.client.last_command = last_command
                 pprint(last_command)
                 if UpbDeviceId.has_value(destination_id):
