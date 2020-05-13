@@ -220,14 +220,14 @@ class Upstart(asyncio.Protocol):
             print(f'Upstart {command.name} data: {data}')
             if command == PimCommand.UPB_NETWORK_TRANSMIT:
                 control_word = data[0:2]
-                link_bit = control_word[0] & PACKETHEADER_LINKBIT >> 7
-                repeater_request = UpbReqRepeater(control_word[0] & 0x60 >> 5)
+                link_bit = (control_word[0] >> PACKETHEADER_LINKBIT) & 7
+                repeater_request = UpbReqRepeater((control_word[0] >> 0x60) & 5)
                 data_len = control_word[0] & 0x1f
                 assert(data_len == len(data) + 1)
                 reserved = control_word[1] & 0x80 >> 7
                 assert(reserved == 0x00)
-                ack_request = UpbReqAck(control_word[1] & 0x70 >> 4)
-                transmit_cnt = control_word[1] & 0x0c >> 2
+                ack_request = UpbReqAck((control_word[1] >> 0x70) & 4)
+                transmit_cnt = (control_word[1] >> 0x0c) & 2
                 transmit_seq = control_word[1] & 0x03
                 network_id = data[2]
                 destination_id = data[3]
