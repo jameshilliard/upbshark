@@ -15,33 +15,78 @@ class PIM(asyncio.Protocol):
         self.buffer = b''
         self.last_command = {}
         self.message_buffer = b''
-        self.transmitted_buffer = b''
         self.pim_accept = False
-        self.pulse_data = 0x00
-        self.pulse_data_buffer = bytearray()
+        self.transmitted = False
+        self.upb_packet = bytearray(64)
         self.pulse_data_seq = 0
-        self.pulse_data_bit_pos = 8
+        self.packet_byte = 0
+        self.packet_crumb = 0
+        self.data_counter = 0
 
     def connection_made(self, transport):
         print("connected to PIM")
         self.connected = True
         self.transport = transport
 
-    def reset_pulse_data(self):
-        print('resetting pulse data')
-        self.message_buffer += self.pulse_data_buffer
-        self.pulse_data = 0x00
-        self.pulse_data_buffer = bytearray()
+    def set_state_zero(self):
+        self.transmitted = False
         self.pulse_data_seq = 0
-        self.pulse_data_bit_pos = 8
+        self.packet_crumb = 0
+        self.packet_byte = 0
+
+    def process_packet(self, packet):
+        control_word = packet[0:2]
+        data_len = (control_word[0] & 0x1f) - 6
+        transmit_cnt = control_word[1] & 0x0c >> 2
+        transmit_seq = control_word[1] & 0x03
+        network_id = packet[2]
+        destination_id = packet[3]
+        source_id = packet[4]
+        mdid_set = MdidSet(packet[5] & 0xe0)
+        if mdid_set == MdidSet.MDID_CORE_COMMANDS:
+            mdid_cmd = MdidCoreCmd(packet[5] & 0x1f)
+        elif mdid_set == MdidSet.MDID_DEVICE_CONTROL_COMMANDS:
+            mdid_cmd = MdidDeviceControlCmd(packet[5] & 0x1f)
+        elif mdid_set == MdidSet.MDID_CORE_REPORTS:
+            mdid_cmd = MdidCoreReport(packet[5] & 0x1f)
+        crc = packet[data_len + 5]
+        computed_crc = cksum(packet[0:data_len + 5])
+        assert(crc == computed_crc)
+        response = {
+            'transmit_cnt': transmit_cnt,
+            'transmit_seq': transmit_seq,
+            'network_id': network_id,
+            'destination_id': destination_id,
+            'device_id': source_id,
+            'mdid_set': mdid_set,
+            'mdid_cmd': mdid_cmd
+        }
+        if mdid_cmd == MdidCoreReport.MDID_DEVICE_CORE_REPORT_REGISTERVALUES:
+            response['setup_register'] = packet[6]
+            response['register_val'] = packet[7:data_len + 5]
+            for index in range(len(response['register_val'])):
+                print(f"Reg index: {index}, value: {hex(response['register_val'][index])}")
+        else:
+            response['data'] = packet[6:data_len + 5]
+        pprint(response)
 
     def line_received(self, line):
         if UpbMessage.has_value(line[UPB_MESSAGE_TYPE]):
             command = UpbMessage(line[UPB_MESSAGE_TYPE])
             data = line[1:]
-            if command != UpbMessage.UPB_MESSAGE_IDLE:
+            if command != UpbMessage.UPB_MESSAGE_IDLE and \
+            command != UpbMessage.UPB_MESSAGE_TRANSMITTED and \
+            not UpbMessage.is_message_data(command):
                 print(f"PIM {command.name} data: {data}")
-            if command == UpbMessage.UPB_MESSAGE_PIMREPORT:
+            if command == UpbMessage.UPB_MESSAGE_IDLE:
+                assert(self.packet_byte == 0)
+                assert(self.pulse_data_seq == 0)
+                assert(self.packet_crumb == 0)
+                self.set_state_zero()
+            elif command == UpbMessage.UPB_MESSAGE_DROP:
+                print('dropped message')
+                self.set_state_zero()
+            elif command == UpbMessage.UPB_MESSAGE_PIMREPORT:
                 print(f"got pim report: {hex(line[UPB_MESSAGE_PIMREPORT_TYPE])} with len: {len(line)}")
                 if len(line) > UPB_MESSAGE_PIMREPORT_TYPE:
                     transmission = UpbTransmission(line[UPB_MESSAGE_PIMREPORT_TYPE])
@@ -60,53 +105,82 @@ class PIM(asyncio.Protocol):
                     print(f'got corrupt pim report: {hex(line[UPB_MESSAGE_PIMREPORT_TYPE])} with len: {len(line)}')
 
             elif command == UpbMessage.UPB_MESSAGE_SYNC:
-                print("Got upb sync")
-                self.pim_accept = False
+                self.packet_byte = 0
+                self.packet_crumb = 0
             elif command == UpbMessage.UPB_MESSAGE_START:
-                self.message_buffer = b''
-                self.transmitted_buffer = b''
+                self.packet_byte = 0
+                self.packet_crumb = 0
             elif UpbMessage.is_message_data(command):
+                self.data_counter += 1
                 if len(data) == 2:
                     seq = unhexlify(b'0' + data[1:2])[0]
-                    if seq != self.pulse_data_seq:
-                        self.reset_pulse_data()
+                    two_bits = command.value - 0x30
+                    assert(seq == self.pulse_data_seq)
                     if seq == self.pulse_data_seq:
-                        print(f'self.pulse_data_bit_pos: {self.pulse_data_bit_pos}')
-                        self.pulse_data_bit_pos -= 2
-                        self.pulse_data |= (command.value - 0x30) << self.pulse_data_bit_pos
+                        if self.packet_crumb == 0:
+                            self.upb_packet[self.packet_byte] = (two_bits << 6)
+                            self.packet_crumb += 1
+                        elif self.packet_crumb == 1:
+                            self.upb_packet[self.packet_byte] |= (two_bits << 4)
+                            self.packet_crumb += 1
+                        elif self.packet_crumb == 2:
+                            self.upb_packet[self.packet_byte] |= (two_bits << 2)
+                            self.packet_crumb += 1
+                        elif self.packet_crumb == 3:
+                            self.upb_packet[self.packet_byte] |= two_bits
+                            self.packet_crumb = 0
+                            self.packet_byte += 1
                         self.pulse_data_seq += 1
                         if self.pulse_data_seq > 0x0f:
                             self.pulse_data_seq = 0
-                        print(f'self.pulse_data: {hex(self.pulse_data)}')
-                        if self.pulse_data_bit_pos == 0x00:
-                            self.pulse_data_buffer.append(self.pulse_data)
-                            self.pulse_data = 0x00
-                            self.pulse_data_bit_pos = 8
                     else:
-                        print(f"Got upb message data bad seq: {self.message_buffer}")
+                        print(f"Got upb message data bad seq: {hex(self.seq)}")
 
             elif command == UpbMessage.UPB_MESSAGE_TRANSMITTED:
-                if self.pim_accept:
-                    self.transmitted_buffer += unhexlify(data)
-                else:
-                    print("git pim transmission outside of accept")
+                self.transmitted = True
+                if len(data) == 2:
+                    seq = unhexlify(b'0' + data[1:2])[0]
+                    two_bits = data[0] - 0x30
+                    assert(seq == self.pulse_data_seq)
+                    if seq == self.pulse_data_seq:
+                        if self.packet_crumb == 0:
+                            self.upb_packet[self.packet_byte] = (two_bits << 6)
+                            self.packet_crumb += 1
+                        elif self.packet_crumb == 1:
+                            self.upb_packet[self.packet_byte] |= (two_bits << 4)
+                            self.packet_crumb += 1
+                        elif self.packet_crumb == 2:
+                            self.upb_packet[self.packet_byte] |= (two_bits << 2)
+                            self.packet_crumb += 1
+                        elif self.packet_crumb == 3:
+                            self.upb_packet[self.packet_byte] |= two_bits
+                            self.packet_crumb = 0
+                            self.packet_byte += 1
+                        self.pulse_data_seq += 1
+                        if self.pulse_data_seq > 0x0f:
+                            self.pulse_data_seq = 0
+                    else:
+                        print(f"Got upb message data bad seq: {hex(self.seq)}")
             elif command == UpbMessage.UPB_MESSAGE_ACK or command == UpbMessage.UPB_MESSAGE_NAK:
-                self.reset_pulse_data()
-                if len(self.transmitted_buffer) != 0:
-                    print(f"Got upb pim message data: {self.transmitted_buffer}")
+                if self.transmitted:
+                    self.message_buffer = bytes(self.upb_packet[1:self.packet_byte - 1])
+                else:
+                    self.message_buffer = bytes(self.upb_packet[0:self.packet_byte])
+                    if len(self.message_buffer) != 0:
+                        self.process_packet(self.message_buffer)
+                if self.transmitted and len(self.message_buffer) != 0:
+                    print(f"Got upb pim message data: {self.message_buffer}")
                 elif len(self.message_buffer) != 0:
                     print(f"Got upb message data: {self.message_buffer}")
                 if len(self.message_buffer) != 0:
-                    if self.last_command.get('mdid_cmd', None) == MdidCoreCmd.MDID_CORE_COMMAND_GETREGISTERVALUES:
-                        print(f"Decoding registers with length {len(self.message_buffer)}")
-                        for index in range(len(self.message_buffer)):
-                            print(f"Reg index: {hex(index)}, value: {hex(self.message_buffer[index])}")
-                    elif self.last_command.get('mdid_cmd', None) == MdidCoreCmd.MDID_CORE_COMMAND_GETDEVICESIGNATURE:
+                    if self.last_command.get('mdid_cmd', None) == MdidCoreCmd.MDID_CORE_COMMAND_GETDEVICESIGNATURE:
                         print(f"Decoding signature with length {len(self.message_buffer)}")
                         for index in range(len(self.message_buffer)):
-                            print(f"Reg index: {hex(index)}, value: {hex(self.message_buffer[index])}")
+                            print(f"Reg index: {index}, value: {hex(self.message_buffer[index])}")
                 self.message_buffer = b''
-                self.transmitted_buffer = b''
+                self.data_counter = 0
+                if self.packet_byte > 0:
+                    self.set_state_zero()
         else:
             print(f'PIM failed to parse line: {line}')
 
