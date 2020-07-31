@@ -1,10 +1,11 @@
 import asyncio
 import sys
-from pprint import pprint
+import hmac
+from pprint import pprint, pformat
 from binascii import unhexlify
 
 from const import PimCommand, UpbMessage, UpbDeviceId, UpbTransmission, UpbReqAck, UpbReqRepeater, \
-MdidSet, MdidCoreCmd, MdidDeviceControlCmd, MdidCoreReport, \
+MdidSet, MdidCoreCmd, MdidDeviceControlCmd, MdidCoreReport, GatewayCmdSendToSerial, \
 UPB_MESSAGE_TYPE, UPB_MESSAGE_PIMREPORT_TYPE, INITIAL_PIM_REG_QUERY_BASE, PACKETHEADER_LINKBIT, PULSE_REPORT_BYTES
 from util import cksum
 
@@ -22,9 +23,20 @@ class PIM(asyncio.Protocol):
         self.packet_byte = 0
         self.packet_crumb = 0
         self.data_counter = 0
+        self.protocol = None
+        self.initial = True
+        self.challenge = None
+        self.authenticated = False
+        self.wrapped = False
+        self.pim_info = {}
 
     def connection_made(self, transport):
         print("connected to PIM")
+        self.initial = True
+        self.challenge = None
+        self.authenticated = False
+        self.wrapped = False
+        self.pim_info = {}
         self.connected = True
         self.transport = transport
 
@@ -70,7 +82,44 @@ class PIM(asyncio.Protocol):
             response['data'] = packet[6:data_len + 5]
         pprint(response)
 
+    def nt_line_received(self, line):
+        print(f'pim null terminated line: {line}')
+        self.wrapped = True
+        errors = {
+            'MAX CONNECTIONS REACHED',
+            'PULSE MODE ACTIVE',
+            'PIM NOT INITIALIZED',
+            'FIRMWARE CORRUPT - FLASH WITH UPSTART'
+        }
+        if self.initial and self.authenticated:
+            result, client = line.split(b'/', maxsplit=1)
+            if result == b'AUTHENTICATION FAILED':
+                print("auth failed")
+            elif result == b'AUTH SUCCEEDED':
+                print("auth succeded")
+                self.initial = False
+            else:
+                print(f"unexpected auth result: {result}")
+        elif self.initial:
+            if line in errors or len(line) < 12:
+                print(f"unhandled error: {line}")
+                return
+            prefix, version, protocol, auth, suffix = line.split(b'/', maxsplit=4)
+            majorVersion, minorVersion = version.split(b'.', maxsplit=1)
+            assert(self.protocol == protocol)
+            self.pim_info = {
+                'prefix': prefix,
+                'version': version,
+                'protocol': protocol,
+                'auth': auth,
+                'majorVersion': majorVersion,
+                'minorVersion': minorVersion
+            }
+            self.challenge = unhexlify(suffix)
+            print(f'self.pim_info:\n{pformat(self.pim_info)}')
+
     def line_received(self, line):
+        print(f'pim line: {line}')
         if UpbMessage.has_value(line[UPB_MESSAGE_TYPE]):
             command = UpbMessage(line[UPB_MESSAGE_TYPE])
             data = line[1:]
@@ -186,7 +235,12 @@ class PIM(asyncio.Protocol):
 
     def data_received(self, data):
         self.buffer += data
-        while b'\r' in self.buffer:
+        print(f'pim buffer: {self.buffer}')
+        while b'\x00' in self.buffer:
+            line, self.buffer = self.buffer.split(b'\x00', 1)
+            if len(line) >= 1:
+                self.nt_line_received(line)
+        while b'\r' in self.buffer and not self.wrapped:
             line, self.buffer = self.buffer.split(b'\r', 1)
             if len(line) > 1:
                 self.line_received(line)
@@ -194,30 +248,71 @@ class PIM(asyncio.Protocol):
             self.server_transport.write(data)
 
     def connection_lost(self, *args):
+        print("pim connection lost")
         self.connected = False
 
 class Upstart(asyncio.Protocol):
 
-    def __init__(self, transport, protocol):
+    def __init__(self, transport, protocol, username=None, password=None):
         self.client = protocol
+        self.initial = False
+        self.client_info = {}
         self.buffer = b''
+        self.username = username
+        self.password = password
 
     def connection_made(self, transport):
         print("Upstart connected")
         # save the transport
+        self.initial = True
+        self.client_info = {}
+        self.client.protocol = None
         self.transport = transport
         self.client.server_transport = self.transport
 
     def send_data(self, data):
         self.client.transport.write(data)
 
+    def nt_line_received(self, line):
+        print(f'upstart null terminated line: {line}')
+        if self.initial:
+            if self.client.pim_info.get('auth', None) == b'AUTH REQUIRED' and \
+                self.client.challenge is not None and self.client.authenticated is not True:
+                assert(len(self.client.challenge) == 64)
+                gatewayUserName, gatewayPasswordHash = line.split(b'/', maxsplit=1)
+                assert(self.username.encode('utf-8') == gatewayUserName)
+                digest = hmac.new(self.password.encode('utf-8'), self.client.challenge, 'md5').hexdigest().swapcase().encode('ascii')
+                assert(digest == gatewayPasswordHash)
+                self.client_info['gatewayUserName'] = self.username
+                self.client_info['gatewayPassword'] = self.password
+                self.client.authenticated = True
+            elif self.client.authenticated is not True:
+                prefix, version, protocol = line.split(b'/', maxsplit=2)
+                majorVersion, minorVersion, buildNumber = version.split(b'.', maxsplit=2)
+                self.client_info = {
+                    'prefix': prefix,
+                    'version': version,
+                    'protocol': protocol,
+                    'majorVersion': majorVersion,
+                    'minorVersion': minorVersion,
+                    'buildNumber': buildNumber
+                }
+                self.client.protocol = protocol
+            print(f'self.client_info:\n{pformat(self.client_info)}')
+        else:
+            if line[0] == GatewayCmdSendToSerial:
+                length_hi = line[1]
+                length_lo = line[2]
+                print(f"gateway to serial line: {line}, length_hi: {length_hi}, length_lo: {length_lo}")
+
     def line_received(self, line):
+        print(f'upstart line: {line}')
         command = PimCommand(line[0])
         data = unhexlify(line[1:-2])
         crc = int(line[-2:], 16)
         computed_crc = cksum(data)
         if crc == computed_crc:
-            print(f'Upstart {command.name} data: {data}')
+            print(f'Upstart {command.name} line: {line}, data: {data}')
             if command == PimCommand.UPB_NETWORK_TRANSMIT:
                 control_word = data[0:2]
                 link_bit = (control_word[0] >> PACKETHEADER_LINKBIT) & 7
@@ -270,21 +365,31 @@ class Upstart(asyncio.Protocol):
 
     def data_received(self, data):
         self.buffer += data
-        while b'\r' in self.buffer:
+        print(f'buffer: {self.buffer}')
+        while b'\x00' in self.buffer:
+            line, self.buffer = self.buffer.split(b'\x00', 1)
+            if len(line) > 0:
+                self.nt_line_received(line)
+        while b'\r' in self.buffer and not self.client.wrapped:
             line, self.buffer = self.buffer.split(b'\r', 1)
             if len(line) >= 1:
                 self.line_received(line)
         self.send_data(data)
 
     def connection_lost(self, *args):
+        print("upstart connection lost")
+        self.initial = False
         self.client.server_transport = None
 
 async def main():
     loop = asyncio.get_event_loop()
 
-    client_t, client_p = await loop.create_connection(PIM, sys.argv[1], 2101)
+    client_t, client_p = await loop.create_connection(PIM, sys.argv[1], int(sys.argv[2]))
 
-    server = await loop.create_server(lambda: Upstart(client_t, client_p), '0.0.0.0', 2101)
+    if len(sys.argv) > 3:
+        server = await loop.create_server(lambda: Upstart(client_t, client_p, sys.argv[3], sys.argv[4]), '0.0.0.0', 2101)
+    else:
+        server = await loop.create_server(lambda: Upstart(client_t, client_p), '0.0.0.0', 2101)
     async with server:
         await server.serve_forever()
 

@@ -15,6 +15,8 @@ PULSE_REPORT_BYTES = 3
 
 PACKETHEADER_LINKBIT = 0x80
 
+GatewayCmdSendToSerial = 0x30
+
 class UpbTransmission(Enum):
     UPB_MESSAGE = 0x55 # U
     UPB_PIM_ACCEPT = 0x41 # A
