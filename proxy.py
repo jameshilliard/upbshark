@@ -3,11 +3,12 @@ import sys
 import hmac
 from pprint import pprint, pformat
 from binascii import unhexlify
+from struct import unpack
 
 from const import PimCommand, UpbMessage, UpbDeviceId, UpbTransmission, UpbReqAck, UpbReqRepeater, \
-MdidSet, MdidCoreCmd, MdidDeviceControlCmd, MdidCoreReport, GatewayCmdSendToSerial, \
+MdidSet, MdidCoreCmd, MdidDeviceControlCmd, MdidCoreReport, GatewayCmd, \
 UPB_MESSAGE_TYPE, UPB_MESSAGE_PIMREPORT_TYPE, INITIAL_PIM_REG_QUERY_BASE, PACKETHEADER_LINKBIT, PULSE_REPORT_BYTES
-from util import cksum
+from util import cksum, hexdump
 
 class PIM(asyncio.Protocol):
 
@@ -83,8 +84,7 @@ class PIM(asyncio.Protocol):
         pprint(response)
 
     def nt_line_received(self, line):
-        print(f'pim null terminated line: {line}')
-        self.wrapped = True
+        print(f'pim null terminated line: {line}, hex: {hexdump(line)}')
         errors = {
             'MAX CONNECTIONS REACHED',
             'PULSE MODE ACTIVE',
@@ -98,6 +98,7 @@ class PIM(asyncio.Protocol):
             elif result == b'AUTH SUCCEEDED':
                 print("auth succeded")
                 self.initial = False
+                self.wrapped = True
             else:
                 print(f"unexpected auth result: {result}")
         elif self.initial:
@@ -235,17 +236,39 @@ class PIM(asyncio.Protocol):
 
     def data_received(self, data):
         self.buffer += data
-        print(f'pim buffer: {self.buffer}')
-        while b'\x00' in self.buffer:
-            line, self.buffer = self.buffer.split(b'\x00', 1)
-            if len(line) >= 1:
-                self.nt_line_received(line)
-        while b'\r' in self.buffer and not self.wrapped:
-            line, self.buffer = self.buffer.split(b'\r', 1)
-            if len(line) > 1:
-                self.line_received(line)
+        #print(f'pim buffer: {self.buffer}, hex: {hexdump(self.buffer)}')
         if self.server_transport:
             self.server_transport.write(data)
+        if self.wrapped:
+            while len(self.buffer) > 0 and GatewayCmd.has_value(self.buffer[0]-1):
+                if len(self.buffer) >= 8:
+                    rcCommand = self.buffer[1]
+                    assert(rcCommand == 0x00)
+                    length = unpack('>H', self.buffer[6:8])[0]
+                    #print(f"pim length: {length}")
+                    if len(self.buffer) >= length + 9:
+                        cmd = GatewayCmd(self.buffer[0]-1)
+                        #print(f"pim cmd: {cmd.name}")
+                        if cmd == GatewayCmd.SEND_TO_SERIAL:
+                            line = self.buffer[8:length+7]
+                            self.buffer = self.buffer[length+10:]
+                            #print(f"pim gateway response: {line}, hex: {hexdump(line)} length: {length}")
+                            self.line_received(line)
+                        elif cmd == GatewayCmd.KEEP_ALIVE:
+                            self.buffer = self.buffer[length+4:]
+                    else:
+                        return
+                else:
+                    return
+        else:
+            while b'\x00' in self.buffer:
+                line, self.buffer = self.buffer.split(b'\x00', 1)
+                if len(line) >= 1:
+                    self.nt_line_received(line)
+            while b'\r' in self.buffer and not self.wrapped:
+                line, self.buffer = self.buffer.split(b'\r', 1)
+                if len(line) > 1:
+                    self.line_received(line)
 
     def connection_lost(self, *args):
         print("pim connection lost")
@@ -274,7 +297,7 @@ class Upstart(asyncio.Protocol):
         self.client.transport.write(data)
 
     def nt_line_received(self, line):
-        print(f'upstart null terminated line: {line}')
+        print(f'upstart null terminated line: {line}, hex: {hexdump(line)}')
         if self.initial:
             if self.client.pim_info.get('auth', None) == b'AUTH REQUIRED' and \
                 self.client.challenge is not None and self.client.authenticated is not True:
@@ -299,14 +322,9 @@ class Upstart(asyncio.Protocol):
                 }
                 self.client.protocol = protocol
             print(f'self.client_info:\n{pformat(self.client_info)}')
-        else:
-            if line[0] == GatewayCmdSendToSerial:
-                length_hi = line[1]
-                length_lo = line[2]
-                print(f"gateway to serial line: {line}, length_hi: {length_hi}, length_lo: {length_lo}")
 
     def line_received(self, line):
-        print(f'upstart line: {line}')
+        #print(f'upstart line: {line}')
         command = PimCommand(line[0])
         data = unhexlify(line[1:-2])
         crc = int(line[-2:], 16)
@@ -365,16 +383,36 @@ class Upstart(asyncio.Protocol):
 
     def data_received(self, data):
         self.buffer += data
-        print(f'buffer: {self.buffer}')
-        while b'\x00' in self.buffer:
-            line, self.buffer = self.buffer.split(b'\x00', 1)
-            if len(line) > 0:
-                self.nt_line_received(line)
-        while b'\r' in self.buffer and not self.client.wrapped:
-            line, self.buffer = self.buffer.split(b'\r', 1)
-            if len(line) >= 1:
-                self.line_received(line)
+        #print(f'upstart buffer: {self.buffer}, hex: {hexdump(self.buffer)}')
         self.send_data(data)
+        if self.client.wrapped:
+            while len(self.buffer) > 0 and GatewayCmd.has_value(self.buffer[0]):
+                if len(self.buffer) >= 4:
+                    length = unpack('>H', self.buffer[1:3])[0]
+                    if len(self.buffer) > length + 4:
+                        #print(f"length: {length}")
+                        cmd = GatewayCmd(self.buffer[0])
+                        #print(f"cmd: {cmd.name}")
+                        if cmd == GatewayCmd.SEND_TO_SERIAL:
+                            line = self.buffer[3:length+2]
+                            self.buffer = self.buffer[length+4:]
+                            #print(f"gateway to serial line: {line}, hex: {hexdump(line)} length: {length}")
+                            self.line_received(line)
+                        elif cmd == GatewayCmd.KEEP_ALIVE:
+                            self.buffer = self.buffer[length+4:]
+                    else:
+                        return
+                else:
+                    return
+        else:
+            while b'\x00' in self.buffer:
+                line, self.buffer = self.buffer.split(b'\x00', 1)
+                if len(line) > 0:
+                    self.nt_line_received(line)
+            while b'\r' in self.buffer and not self.client.wrapped:
+                line, self.buffer = self.buffer.split(b'\r', 1)
+                if len(line) >= 1:
+                    self.line_received(line)
 
     def connection_lost(self, *args):
         print("upstart connection lost")
